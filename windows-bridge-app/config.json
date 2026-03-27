@@ -1,0 +1,31 @@
+{
+  "target_device": {
+    "hardware_id": "USB\\VID_XXXX&PID_XXXX",
+    "friendly_name": "Infortab Gateway",
+    "mac_prefix": "78:E9:80",
+    "priority_ip": "192.168.220.206",
+    "detection_method": "mac_address"
+  },
+  "ethernet_adapter": {
+    "name": "Ethernet",
+    "static_ip": "192.168.220.100",
+    "subnet_mask": "255.255.255.0",
+    "gateway": "192.168.220.1",
+    "dns_primary": "8.8.8.8",
+    "dns_secondary": "8.8.4.4"
+  },
+  "wifi_adapter": {
+    "name": "Wi-Fi"
+  },
+  "bridge": {
+    "name": "NetworkBridge",
+    "auto_create": true
+  },
+  "app": {
+    "poll_interval_seconds": 3,
+    "start_minimized": true,
+    "auto_start_with_windows": false,
+    "log_file": "bridge_app.log",
+    "log_level": "INFO"
+  }
+}

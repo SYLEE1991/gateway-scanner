@@ -1,0 +1,4 @@
+pystray>=0.19.5
+Pillow>=10.0.0
+WMI>=1.5.1
+pywin32>=306
