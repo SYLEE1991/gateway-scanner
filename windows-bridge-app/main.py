@@ -82,11 +82,43 @@ def main():
         logger.info("=== Device Connected - Configuring Network ===")
         logger.info("Detected device IP: %s, MAC: %s", device_info.ip, device_info.mac)
 
+        # Calculate PC IP based on the device's actual IP (device IP - 1)
+        # This ensures the PC is on the same subnet regardless of the device's IP range.
+        device_ip = device_info.ip
+        subnet_mask = config.ethernet_adapter.subnet_mask
+
+        if device_ip:
+            try:
+                parts = [int(x) for x in device_ip.split(".")]
+                mask_parts = [int(x) for x in subnet_mask.split(".")]
+
+                # PC IP = device IP - 1 (if .1, use device IP + 1)
+                pc_parts = parts.copy()
+                pc_parts[3] = pc_parts[3] - 1
+                if pc_parts[3] < 1:
+                    pc_parts[3] = parts[3] + 1
+                pc_ip = ".".join(str(x) for x in pc_parts)
+
+                # Gateway = subnet base + .1
+                base = [parts[i] & mask_parts[i] for i in range(4)]
+                base[3] = 1
+                gateway = ".".join(str(x) for x in base)
+
+                logger.info("Device IP: %s -> PC IP: %s, Gateway: %s", device_ip, pc_ip, gateway)
+            except Exception:
+                logger.warning("Failed to calculate IP from device IP %s, using config defaults", device_ip)
+                pc_ip = config.ethernet_adapter.static_ip
+                gateway = config.ethernet_adapter.gateway
+        else:
+            # No device IP discovered (e.g. hardware_id detection), use config defaults
+            pc_ip = config.ethernet_adapter.static_ip
+            gateway = config.ethernet_adapter.gateway
+
         ok = net_config.set_static_ip(
             config.ethernet_adapter.name,
-            config.ethernet_adapter.static_ip,
-            config.ethernet_adapter.subnet_mask,
-            config.ethernet_adapter.gateway,
+            pc_ip,
+            subnet_mask,
+            gateway,
         )
         if not ok:
             logger.error("Failed to set static IP")

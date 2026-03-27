@@ -228,10 +228,16 @@ class ScanWindow:
         ethernet_name = ethernet_cfg.name
 
         if mode == "direct":
-            # Direct Connection: neighbor table에서 이더넷 장비만 MAC으로 찾음
-            self._update_status("Checking ethernet adapter neighbors...")
-            self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
+            # --- Phase 1: ARP sniffing (subnet-agnostic, finds any IP range) ---
+            self._update_status("Listening for ARP packets from device...")
+            self._sniff_arp_devices(mac_prefix, ethernet_name)
 
+            # --- Phase 2: Neighbor table check ---
+            if not self._found_devices:
+                self._update_status("Checking ethernet adapter neighbors...")
+                self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
+
+            # --- Phase 3: Broadcast + priority IP ping fallback ---
             if not self._found_devices:
                 self._update_status("Sending broadcast to discover devices...")
                 try:
@@ -258,6 +264,11 @@ class ScanWindow:
 
         else:
             # Network Scan: 모든 인터페이스에서 전체 검색
+
+            # ARP sniff first (catches devices on any subnet)
+            self._update_status("Listening for ARP packets...")
+            self._sniff_arp_devices(mac_prefix, ethernet_name)
+
             ip_parts = [int(x) for x in local_ip.split(".")]
             mask_parts = [int(x) for x in ethernet_cfg.subnet_mask.split(".")]
             base = [ip_parts[i] & mask_parts[i] for i in range(4)]
@@ -302,6 +313,59 @@ class ScanWindow:
 
         self._update_status("Scan complete")
         self._root.after(0, self._scan_complete)
+
+    def _sniff_arp_devices(self, raw_prefix: str, adapter_name: str):
+        """Sniff ARP packets to discover devices by MAC prefix (subnet-agnostic).
+
+        Listens for ARP traffic on the ethernet interface. Devices send ARP packets
+        (gratuitous ARP on link-up, ARP requests for gateway) which contain their
+        MAC and IP regardless of the PC's IP configuration.
+        """
+        try:
+            from scapy.all import sniff, ARP
+            from scapy.arch.windows import get_windows_if_list
+        except ImportError:
+            logger.debug("scapy not available, skipping ARP sniff in scan")
+            return
+
+        # Find scapy interface
+        iface = None
+        try:
+            for if_info in get_windows_if_list():
+                if (if_info.get("name", "") == adapter_name or
+                        adapter_name in if_info.get("description", "") or
+                        adapter_name in if_info.get("netid", "")):
+                    iface = if_info.get("guid") or if_info.get("name")
+                    break
+        except Exception:
+            pass
+        if not iface:
+            iface = adapter_name
+
+        seen_ips = {d["ip"] for d in self._found_devices}
+
+        def process_arp(pkt):
+            if pkt.haslayer(ARP):
+                arp = pkt[ARP]
+                src_mac = arp.hwsrc.upper().replace(":", "").replace("-", "")
+                if src_mac.startswith(raw_prefix[:6]) and arp.psrc not in seen_ips:
+                    mac_display = arp.hwsrc.upper()
+                    device = {"ip": arp.psrc, "mac": mac_display, "interface": adapter_name}
+                    self._found_devices.append(device)
+                    seen_ips.add(arp.psrc)
+                    self._root.after(0, lambda d=device: self._add_device_to_tree(d))
+
+        try:
+            logger.info("ARP sniffing on '%s' for %s (timeout=5s)", iface, raw_prefix)
+            sniff(
+                iface=iface,
+                filter="arp",
+                prn=process_arp,
+                timeout=5,
+                store=False,
+            )
+        except Exception:
+            logger.exception("ARP sniff failed in scan window")
 
     def _collect_devices(self, prefix_dash, raw_prefix, mode, ethernet_name, ethernet_ip):
         """Collect matching devices with interface info from neighbor table."""
