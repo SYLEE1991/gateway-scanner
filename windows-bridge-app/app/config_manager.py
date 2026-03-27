@@ -1,6 +1,13 @@
 import json
 import dataclasses
 from pathlib import Path
+from typing import List
+
+
+@dataclasses.dataclass
+class ScanSubnet:
+    ip: str       # PC IP to set on this subnet (e.g. "192.168.220.100")
+    gateway: str  # Gateway for this subnet (e.g. "192.168.220.1")
 
 
 @dataclasses.dataclass
@@ -10,6 +17,7 @@ class TargetDevice:
     mac_prefix: str  # OUI prefix, e.g. "78:E9:80" (first 3 bytes of MAC)
     priority_ip: str  # Most common device IP, checked first for fast detection
     detection_method: str  # "hardware_id", "friendly_name", "mac_address", or "ethernet_link"
+    scan_subnets: List[ScanSubnet]  # Subnets to try when device IP is unknown
 
 
 @dataclasses.dataclass
@@ -58,6 +66,11 @@ DEFAULT_CONFIG = {
         "mac_prefix": "78:E9:80",
         "priority_ip": "192.168.220.206",
         "detection_method": "mac_address",
+        "scan_subnets": [
+            {"ip": "192.168.220.100", "gateway": "192.168.220.1"},
+            {"ip": "192.168.230.100", "gateway": "192.168.230.1"},
+            {"ip": "192.168.1.100",   "gateway": "192.168.1.1"},
+        ],
     },
     "ethernet_adapter": {
         "name": "Ethernet",
@@ -89,8 +102,13 @@ class ConfigManager:
 
         data = json.loads(self._path.read_text(encoding="utf-8"))
 
+        # Parse scan_subnets (with backward compatibility)
+        td = data["target_device"]
+        scan_subnets_raw = td.pop("scan_subnets", [])
+        scan_subnets = [ScanSubnet(**s) for s in scan_subnets_raw]
+
         return AppConfig(
-            target_device=TargetDevice(**data["target_device"]),
+            target_device=TargetDevice(**td, scan_subnets=scan_subnets),
             ethernet_adapter=EthernetConfig(**data["ethernet_adapter"]),
             wifi_adapter=WifiConfig(**data["wifi_adapter"]),
             bridge=BridgeConfig(**data["bridge"]),

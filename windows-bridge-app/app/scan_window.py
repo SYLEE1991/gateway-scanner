@@ -219,9 +219,11 @@ class ScanWindow:
 
     def _do_scan(self, mode: str):
         import concurrent.futures
+        import time
 
         ethernet_cfg = self._config.ethernet_adapter
-        mac_prefix = self._config.target_device.mac_prefix.upper().replace(":", "").replace("-", "")
+        device_cfg = self._config.target_device
+        mac_prefix = device_cfg.mac_prefix.upper().replace(":", "").replace("-", "")
         prefix_dash = f"{mac_prefix[0:2]}-{mac_prefix[2:4]}-{mac_prefix[4:6]}"
 
         # Resolve the actual adapter name (handles "Ethernet" vs "이더넷" etc.)
@@ -235,46 +237,59 @@ class ScanWindow:
                      mode, ethernet_name, ethernet_cfg.name, actual_ip, ethernet_cfg.static_ip)
 
         if mode == "direct":
-            # --- Phase 1: ARP sniffing (subnet-agnostic, finds any IP range) ---
-            self._update_status("Listening for ARP packets from device...")
-            self._sniff_arp_devices(mac_prefix, ethernet_name)
-
-            # --- Phase 2: Subnet ping sweep on the adapter's actual IP range ---
-            if not self._found_devices and actual_ip:
-                self._update_status(f"Scanning subnet of {actual_ip}...")
+            # --- Phase 1: Scan current subnet (if adapter has an IP) ---
+            if actual_ip:
+                self._update_status(f"Scanning current subnet ({actual_ip})...")
                 self._ping_sweep_subnet(actual_ip, ethernet_cfg.subnet_mask)
                 self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, actual_ip)
 
-            # --- Phase 3: Priority IP + config subnet fallback ---
-            if not self._found_devices:
-                priority_ip = self._config.target_device.priority_ip
-                if priority_ip:
-                    self._update_status(f"Pinging {priority_ip}...")
-                    try:
-                        subprocess.run(
-                            ["ping", "-n", "2", "-w", "1000", priority_ip],
-                            capture_output=True, timeout=5,
-                        )
-                    except Exception:
-                        pass
+            # --- Phase 2: Quick check priority IP ---
+            if not self._found_devices and device_cfg.priority_ip:
+                self._update_status(f"Checking priority IP {device_cfg.priority_ip}...")
+                try:
+                    subprocess.run(
+                        ["ping", "-n", "2", "-w", "1000", device_cfg.priority_ip],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+                self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, actual_ip or local_ip)
 
-                # Also try config's static IP subnet if different from actual
-                config_ip = ethernet_cfg.static_ip
-                if config_ip != actual_ip:
-                    self._update_status(f"Scanning config subnet {config_ip}...")
-                    self._ping_sweep_subnet(config_ip, ethernet_cfg.subnet_mask)
+            # --- Phase 3: Cycle through scan_subnets ---
+            if not self._found_devices and device_cfg.scan_subnets:
+                tried_subnets = set()
+                if actual_ip:
+                    p = [int(x) for x in actual_ip.split(".")]
+                    m = [int(x) for x in ethernet_cfg.subnet_mask.split(".")]
+                    tried_subnets.add(tuple(p[i] & m[i] for i in range(4)))
 
-                self._update_status("Re-checking neighbors...")
-                self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
+                for subnet in device_cfg.scan_subnets:
+                    if self._found_devices:
+                        break
+
+                    s_parts = [int(x) for x in subnet.ip.split(".")]
+                    m = [int(x) for x in ethernet_cfg.subnet_mask.split(".")]
+                    s_base = tuple(s_parts[i] & m[i] for i in range(4))
+
+                    if s_base in tried_subnets:
+                        continue
+                    tried_subnets.add(s_base)
+
+                    self._update_status(f"Trying subnet {'.'.join(str(x) for x in s_base)}.x (PC IP: {subnet.ip})...")
+
+                    # Set PC IP to this subnet
+                    ok = self._set_adapter_ip(ethernet_name, subnet.ip, ethernet_cfg.subnet_mask, subnet.gateway)
+                    if not ok:
+                        continue
+
+                    time.sleep(2)
+                    self._ping_sweep_subnet(subnet.ip, ethernet_cfg.subnet_mask)
+                    self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, subnet.ip)
 
         else:
             # Network Scan: 모든 인터페이스에서 전체 검색
 
-            # ARP sniff first (catches devices on any subnet)
-            self._update_status("Listening for ARP packets...")
-            self._sniff_arp_devices(mac_prefix, ethernet_name)
-
-            priority_ip = self._config.target_device.priority_ip
+            priority_ip = device_cfg.priority_ip
             if priority_ip:
                 self._update_status(f"Checking priority IP: {priority_ip}...")
                 try:
@@ -394,113 +409,29 @@ class ScanWindow:
         except Exception:
             logger.exception("Ping sweep failed")
 
-    def _sniff_arp_devices(self, raw_prefix: str, adapter_name: str):
-        """Capture ARP packets using Windows built-in pktmon (no install required).
-
-        pktmon captures at the NDIS level, so ARP packets are visible regardless
-        of the PC's IP configuration. Parses raw ETL binary for ARP packets
-        matching the target MAC prefix.
-        """
-        import tempfile
-        import os
-
-        mac_bytes = bytes.fromhex(raw_prefix[:6])
-        etl_file = os.path.join(tempfile.gettempdir(), "gw_scanner_scan.etl")
-
-        try:
-            # Stop any leftover capture
-            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
-            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=5)
-            try:
-                os.remove(etl_file)
-            except OSError:
-                pass
-
-            # Start capture
-            logger.info("pktmon: starting ARP scan capture (timeout=5s)")
-            r = subprocess.run(
-                ["pktmon", "start", "-c", "--pkt-size", "128", "-f", etl_file],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode != 0:
-                r = subprocess.run(
-                    ["pktmon", "start", "--capture", "--pkt-size", "128", "--log-file", etl_file],
-                    capture_output=True, text=True, timeout=5,
-                )
-            if r.returncode != 0:
-                logger.warning("pktmon start failed: %s", r.stderr.strip())
-                return
-
-            import time
-            time.sleep(5)
-
-            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
-
-            if not os.path.exists(etl_file):
-                return
-
-            # Parse ETL for all matching ARP packets
-            seen_ips = {d["ip"] for d in self._found_devices}
-            devices = self._parse_etl_all_arp(etl_file, mac_bytes)
-
-            for ip_str, mac_str in devices:
-                if ip_str not in seen_ips:
-                    device = {"ip": ip_str, "mac": mac_str, "interface": adapter_name}
-                    self._found_devices.append(device)
-                    seen_ips.add(ip_str)
-                    self._root.after(0, lambda d=device: self._add_device_to_tree(d))
-
-        except FileNotFoundError:
-            logger.debug("pktmon not available on this system")
-        except Exception:
-            logger.exception("pktmon ARP scan failed")
-        finally:
-            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
-            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=5)
-            try:
-                os.remove(etl_file)
-            except OSError:
-                pass
-
     @staticmethod
-    def _parse_etl_all_arp(etl_file: str, mac_prefix_bytes: bytes):
-        """Parse ETL file for ALL ARP packets matching MAC prefix.
-
-        Returns list of (ip_str, mac_str) tuples for all unique matches.
-        """
-        arp_sig = b'\x08\x06\x00\x01\x08\x00\x06\x04'
-
-        with open(etl_file, "rb") as f:
-            data = f.read()
-
-        results = []
-        seen_ips = set()
-        pos = 0
-
-        while True:
-            idx = data.find(arp_sig, pos)
-            if idx == -1:
-                break
-
-            sender_mac_offset = idx + 8 + 2
-            sender_ip_offset = sender_mac_offset + 6
-
-            if sender_ip_offset + 4 <= len(data):
-                sender_mac_3 = data[sender_mac_offset:sender_mac_offset + 3]
-                if sender_mac_3 == mac_prefix_bytes:
-                    full_mac = data[sender_mac_offset:sender_mac_offset + 6]
-                    sender_ip = data[sender_ip_offset:sender_ip_offset + 4]
-
-                    ip_str = ".".join(str(b) for b in sender_ip)
-                    mac_str = "-".join(f"{b:02X}" for b in full_mac)
-
-                    if sender_ip[0] not in (0, 127, 255) and ip_str not in seen_ips:
-                        results.append((ip_str, mac_str))
-                        seen_ips.add(ip_str)
-
-            pos = idx + 1
-
-        return results
+    def _set_adapter_ip(adapter_name: str, ip: str, mask: str, gateway: str) -> bool:
+        """Set static IP on the adapter via netsh."""
+        try:
+            cmd = [
+                "netsh", "interface", "ip", "set", "address",
+                f"name={adapter_name}",
+                "source=static",
+                f"addr={ip}",
+                f"mask={mask}",
+                f"gateway={gateway}",
+                "gwmetric=1",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                logger.info("Set adapter '%s' IP to %s", adapter_name, ip)
+                return True
+            else:
+                logger.error("Failed to set IP %s: %s", ip, result.stderr.strip())
+                return False
+        except Exception:
+            logger.exception("Exception setting IP %s", ip)
+            return False
 
     def _collect_devices(self, prefix_dash, raw_prefix, mode, ethernet_name, ethernet_ip):
         """Collect matching devices with interface info from neighbor table."""

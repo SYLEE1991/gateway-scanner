@@ -4,7 +4,12 @@
     "friendly_name": "Infortab Gateway",
     "mac_prefix": "78:E9:80",
     "priority_ip": "192.168.220.206",
-    "detection_method": "mac_address"
+    "detection_method": "mac_address",
+    "scan_subnets": [
+      {"ip": "192.168.220.100", "gateway": "192.168.220.1"},
+      {"ip": "192.168.230.100", "gateway": "192.168.230.1"},
+      {"ip": "192.168.1.100",   "gateway": "192.168.1.1"}
+    ]
   },
   "ethernet_adapter": {
     "name": "Ethernet",
