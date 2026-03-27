@@ -224,30 +224,28 @@ class ScanWindow:
         mac_prefix = self._config.target_device.mac_prefix.upper().replace(":", "").replace("-", "")
         prefix_dash = f"{mac_prefix[0:2]}-{mac_prefix[2:4]}-{mac_prefix[4:6]}"
 
-        local_ip = ethernet_cfg.static_ip
         ethernet_name = ethernet_cfg.name
+
+        # Detect the adapter's actual current IP (may differ from config)
+        actual_ip = self._get_adapter_current_ip(ethernet_name)
+        local_ip = actual_ip or ethernet_cfg.static_ip
+
+        logger.info("Scan mode=%s, adapter='%s', actual_ip=%s, config_ip=%s",
+                     mode, ethernet_name, actual_ip, ethernet_cfg.static_ip)
 
         if mode == "direct":
             # --- Phase 1: ARP sniffing (subnet-agnostic, finds any IP range) ---
             self._update_status("Listening for ARP packets from device...")
             self._sniff_arp_devices(mac_prefix, ethernet_name)
 
-            # --- Phase 2: Neighbor table check ---
-            if not self._found_devices:
-                self._update_status("Checking ethernet adapter neighbors...")
-                self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
+            # --- Phase 2: Subnet ping sweep on the adapter's actual IP range ---
+            if not self._found_devices and actual_ip:
+                self._update_status(f"Scanning subnet of {actual_ip}...")
+                self._ping_sweep_subnet(actual_ip, ethernet_cfg.subnet_mask)
+                self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, actual_ip)
 
-            # --- Phase 3: Broadcast + priority IP ping fallback ---
+            # --- Phase 3: Priority IP + config subnet fallback ---
             if not self._found_devices:
-                self._update_status("Sending broadcast to discover devices...")
-                try:
-                    subprocess.run(
-                        ["ping", "-n", "2", "-w", "1000", "255.255.255.255"],
-                        capture_output=True, timeout=5,
-                    )
-                except Exception:
-                    pass
-
                 priority_ip = self._config.target_device.priority_ip
                 if priority_ip:
                     self._update_status(f"Pinging {priority_ip}...")
@@ -259,6 +257,12 @@ class ScanWindow:
                     except Exception:
                         pass
 
+                # Also try config's static IP subnet if different from actual
+                config_ip = ethernet_cfg.static_ip
+                if config_ip != actual_ip:
+                    self._update_status(f"Scanning config subnet {config_ip}...")
+                    self._ping_sweep_subnet(config_ip, ethernet_cfg.subnet_mask)
+
                 self._update_status("Re-checking neighbors...")
                 self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
 
@@ -268,10 +272,6 @@ class ScanWindow:
             # ARP sniff first (catches devices on any subnet)
             self._update_status("Listening for ARP packets...")
             self._sniff_arp_devices(mac_prefix, ethernet_name)
-
-            ip_parts = [int(x) for x in local_ip.split(".")]
-            mask_parts = [int(x) for x in ethernet_cfg.subnet_mask.split(".")]
-            base = [ip_parts[i] & mask_parts[i] for i in range(4)]
 
             priority_ip = self._config.target_device.priority_ip
             if priority_ip:
@@ -285,9 +285,48 @@ class ScanWindow:
                     pass
                 self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
 
+            self._update_status("Scanning full subnet...")
+            self._ping_sweep_subnet(local_ip, ethernet_cfg.subnet_mask)
+            self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
+
+        self._update_status("Scan complete")
+        self._root.after(0, self._scan_complete)
+
+    def _get_adapter_current_ip(self, adapter_name: str):
+        """Get the actual current IPv4 address of the adapter (not from config).
+
+        Returns the IP string, or None if adapter has no IPv4 address.
+        Skips APIPA addresses (169.254.x.x).
+        """
+        try:
+            ps_cmd = (
+                f"Get-NetIPAddress -InterfaceAlias '{adapter_name}' -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                f"Select-Object -Property IPAddress | Format-Table -HideTableHeaders"
+            )
+            result = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.split("\n"):
+                ip = line.strip()
+                if ip and not ip.startswith("169.254."):
+                    logger.info("Adapter '%s' current IP: %s", adapter_name, ip)
+                    return ip
+        except Exception:
+            logger.exception("Failed to get adapter current IP")
+        return None
+
+    def _ping_sweep_subnet(self, local_ip: str, subnet_mask: str):
+        """Parallel ping sweep of the subnet to populate ARP table."""
+        import concurrent.futures
+
+        try:
+            ip_parts = [int(x) for x in local_ip.split(".")]
+            mask_parts = [int(x) for x in subnet_mask.split(".")]
+            base = [ip_parts[i] & mask_parts[i] for i in range(4)]
+
             total = 254
             scanned = [0]
-            self._update_status("Scanning full subnet...")
 
             def ping_host(host_id):
                 target = base.copy()
@@ -308,11 +347,8 @@ class ScanWindow:
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
                 pool.map(ping_host, range(1, 255))
-
-            self._collect_devices(prefix_dash, mac_prefix, mode, ethernet_name, local_ip)
-
-        self._update_status("Scan complete")
-        self._root.after(0, self._scan_complete)
+        except Exception:
+            logger.exception("Ping sweep failed")
 
     def _sniff_arp_devices(self, raw_prefix: str, adapter_name: str):
         """Capture ARP packets using Windows built-in pktmon (no install required).
