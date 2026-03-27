@@ -315,57 +315,112 @@ class ScanWindow:
         self._root.after(0, self._scan_complete)
 
     def _sniff_arp_devices(self, raw_prefix: str, adapter_name: str):
-        """Sniff ARP packets to discover devices by MAC prefix (subnet-agnostic).
+        """Capture ARP packets using Windows built-in pktmon (no install required).
 
-        Listens for ARP traffic on the ethernet interface. Devices send ARP packets
-        (gratuitous ARP on link-up, ARP requests for gateway) which contain their
-        MAC and IP regardless of the PC's IP configuration.
+        pktmon captures at the NDIS level, so ARP packets are visible regardless
+        of the PC's IP configuration. Parses raw ETL binary for ARP packets
+        matching the target MAC prefix.
         """
+        import tempfile
+        import os
+
+        mac_bytes = bytes.fromhex(raw_prefix[:6])
+        etl_file = os.path.join(tempfile.gettempdir(), "gw_scanner_scan.etl")
+
         try:
-            from scapy.all import sniff, ARP
-            from scapy.arch.windows import get_windows_if_list
-        except ImportError:
-            logger.debug("scapy not available, skipping ARP sniff in scan")
-            return
+            # Stop any leftover capture
+            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
+            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=5)
+            try:
+                os.remove(etl_file)
+            except OSError:
+                pass
 
-        # Find scapy interface
-        iface = None
-        try:
-            for if_info in get_windows_if_list():
-                if (if_info.get("name", "") == adapter_name or
-                        adapter_name in if_info.get("description", "") or
-                        adapter_name in if_info.get("netid", "")):
-                    iface = if_info.get("guid") or if_info.get("name")
-                    break
-        except Exception:
-            pass
-        if not iface:
-            iface = adapter_name
+            # Start capture
+            logger.info("pktmon: starting ARP scan capture (timeout=5s)")
+            r = subprocess.run(
+                ["pktmon", "start", "-c", "--pkt-size", "128", "-f", etl_file],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                r = subprocess.run(
+                    ["pktmon", "start", "--capture", "--pkt-size", "128", "--log-file", etl_file],
+                    capture_output=True, text=True, timeout=5,
+                )
+            if r.returncode != 0:
+                logger.warning("pktmon start failed: %s", r.stderr.strip())
+                return
 
-        seen_ips = {d["ip"] for d in self._found_devices}
+            import time
+            time.sleep(5)
 
-        def process_arp(pkt):
-            if pkt.haslayer(ARP):
-                arp = pkt[ARP]
-                src_mac = arp.hwsrc.upper().replace(":", "").replace("-", "")
-                if src_mac.startswith(raw_prefix[:6]) and arp.psrc not in seen_ips:
-                    mac_display = arp.hwsrc.upper()
-                    device = {"ip": arp.psrc, "mac": mac_display, "interface": adapter_name}
+            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
+
+            if not os.path.exists(etl_file):
+                return
+
+            # Parse ETL for all matching ARP packets
+            seen_ips = {d["ip"] for d in self._found_devices}
+            devices = self._parse_etl_all_arp(etl_file, mac_bytes)
+
+            for ip_str, mac_str in devices:
+                if ip_str not in seen_ips:
+                    device = {"ip": ip_str, "mac": mac_str, "interface": adapter_name}
                     self._found_devices.append(device)
-                    seen_ips.add(arp.psrc)
+                    seen_ips.add(ip_str)
                     self._root.after(0, lambda d=device: self._add_device_to_tree(d))
 
-        try:
-            logger.info("ARP sniffing on '%s' for %s (timeout=5s)", iface, raw_prefix)
-            sniff(
-                iface=iface,
-                filter="arp",
-                prn=process_arp,
-                timeout=5,
-                store=False,
-            )
+        except FileNotFoundError:
+            logger.debug("pktmon not available on this system")
         except Exception:
-            logger.exception("ARP sniff failed in scan window")
+            logger.exception("pktmon ARP scan failed")
+        finally:
+            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
+            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=5)
+            try:
+                os.remove(etl_file)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _parse_etl_all_arp(etl_file: str, mac_prefix_bytes: bytes):
+        """Parse ETL file for ALL ARP packets matching MAC prefix.
+
+        Returns list of (ip_str, mac_str) tuples for all unique matches.
+        """
+        arp_sig = b'\x08\x06\x00\x01\x08\x00\x06\x04'
+
+        with open(etl_file, "rb") as f:
+            data = f.read()
+
+        results = []
+        seen_ips = set()
+        pos = 0
+
+        while True:
+            idx = data.find(arp_sig, pos)
+            if idx == -1:
+                break
+
+            sender_mac_offset = idx + 8 + 2
+            sender_ip_offset = sender_mac_offset + 6
+
+            if sender_ip_offset + 4 <= len(data):
+                sender_mac_3 = data[sender_mac_offset:sender_mac_offset + 3]
+                if sender_mac_3 == mac_prefix_bytes:
+                    full_mac = data[sender_mac_offset:sender_mac_offset + 6]
+                    sender_ip = data[sender_ip_offset:sender_ip_offset + 4]
+
+                    ip_str = ".".join(str(b) for b in sender_ip)
+                    mac_str = "-".join(f"{b:02X}" for b in full_mac)
+
+                    if sender_ip[0] not in (0, 127, 255) and ip_str not in seen_ips:
+                        results.append((ip_str, mac_str))
+                        seen_ips.add(ip_str)
+
+            pos = idx + 1
+
+        return results
 
     def _collect_devices(self, prefix_dash, raw_prefix, mode, ethernet_name, ethernet_ip):
         """Collect matching devices with interface info from neighbor table."""

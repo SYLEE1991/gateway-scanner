@@ -176,75 +176,125 @@ class DeviceMonitor:
         return self._find_mac_in_arp(prefix_dash, raw)
 
     def _sniff_arp_for_device(self, raw_prefix: str, adapter_name: str):
-        """Sniff ARP packets on the ethernet interface to find a device by MAC prefix.
+        """Capture ARP packets using Windows built-in pktmon (no install required).
 
-        ARP operates at Layer 2, so the PC does NOT need an IP on the same subnet.
-        Devices typically send ARP packets (gratuitous ARP on link-up, or ARP requests
-        for their gateway) which reveal both their MAC and IP address.
+        pktmon captures at the NDIS level, so ARP packets are visible regardless
+        of the PC's IP configuration. The captured ETL file contains raw packet
+        data which we parse directly for the ARP signature + target MAC prefix.
 
+        Available on Windows 10 1809+ and Windows 11. Requires admin (already have).
         Returns DetectedDevice if found within timeout, None otherwise.
         """
-        try:
-            from scapy.all import sniff, ARP, conf, get_if_list
-        except ImportError:
-            logger.debug("scapy not available, skipping ARP sniff")
-            return None
+        import subprocess
+        import tempfile
+        import os
 
-        # Find the scapy interface name matching our adapter
-        iface = self._get_scapy_iface(adapter_name)
-        if not iface:
-            logger.warning("Could not find scapy interface for '%s'", adapter_name)
-            return None
-
-        logger.debug("Sniffing ARP on interface '%s' for MAC prefix %s (timeout=5s)", iface, raw_prefix)
-
-        found_device = [None]  # mutable container for closure
-
-        def arp_match(pkt):
-            if pkt.haslayer(ARP):
-                arp = pkt[ARP]
-                # Check source MAC (hwsrc) - this is the sender's MAC
-                src_mac = arp.hwsrc.upper().replace(":", "").replace("-", "")
-                if src_mac.startswith(raw_prefix[:6]):
-                    found_device[0] = DetectedDevice(
-                        ip=arp.psrc,
-                        mac=arp.hwsrc.upper(),
-                        method="mac_address",
-                    )
-                    return True  # stop sniffing
-            return False
+        mac_bytes = bytes.fromhex(raw_prefix[:6])
+        etl_file = os.path.join(tempfile.gettempdir(), "gw_scanner_arp.etl")
 
         try:
-            sniff(
-                iface=iface,
-                filter="arp",
-                stop_filter=arp_match,
-                timeout=5,
-                store=False,
+            # Stop any leftover capture and clean filters
+            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
+            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=5)
+            try:
+                os.remove(etl_file)
+            except OSError:
+                pass
+
+            # Start packet capture (all packets, short timeout keeps file small)
+            logger.debug("pktmon: starting ARP capture on '%s' (timeout=5s)", adapter_name)
+            r = subprocess.run(
+                ["pktmon", "start", "-c", "--pkt-size", "128", "-f", etl_file],
+                capture_output=True, text=True, timeout=5,
             )
-        except Exception:
-            logger.exception("ARP sniff failed on '%s'", iface)
-            return None
+            if r.returncode != 0:
+                # Try older pktmon syntax (Windows 10 1809-1903)
+                r = subprocess.run(
+                    ["pktmon", "start", "--capture", "--pkt-size", "128", "--log-file", etl_file],
+                    capture_output=True, text=True, timeout=5,
+                )
+            if r.returncode != 0:
+                logger.warning("pktmon start failed: %s", r.stderr.strip())
+                return None
 
-        return found_device[0]
+            # Wait for device ARP traffic
+            time.sleep(5)
+
+            # Stop capture
+            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
+
+            if not os.path.exists(etl_file):
+                logger.debug("pktmon: no ETL file produced")
+                return None
+
+            # Parse raw ETL binary for ARP packets matching our MAC prefix
+            return self._parse_etl_for_arp(etl_file, mac_bytes)
+
+        except FileNotFoundError:
+            logger.debug("pktmon not available on this system")
+            return None
+        except Exception:
+            logger.exception("pktmon ARP capture failed")
+            return None
+        finally:
+            subprocess.run(["pktmon", "stop"], capture_output=True, timeout=5)
+            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, timeout=5)
+            try:
+                os.remove(etl_file)
+            except OSError:
+                pass
 
     @staticmethod
-    def _get_scapy_iface(adapter_name: str):
-        """Map a Windows adapter name (e.g. 'Ethernet') to scapy's interface identifier."""
-        try:
-            from scapy.arch.windows import get_windows_if_list
-            for iface in get_windows_if_list():
-                # Match by name or description
-                if (iface.get("name", "") == adapter_name or
-                        adapter_name in iface.get("description", "") or
-                        adapter_name in iface.get("netid", "")):
-                    # Return the GUID or name that scapy uses
-                    return iface.get("guid") or iface.get("name")
-        except Exception:
-            pass
+    def _parse_etl_for_arp(etl_file: str, mac_prefix_bytes: bytes):
+        """Parse raw ETL file binary for ARP packets with a matching MAC prefix.
 
-        # Simple fallback: try the adapter name directly
-        return adapter_name
+        ARP over Ethernet frame layout (after Ethernet header):
+          EtherType  : 08 06               (ARP)
+          HW Type    : 00 01               (Ethernet)
+          Proto Type : 08 00               (IPv4)
+          HW Size    : 06
+          Proto Size : 04
+          Opcode     : 00 01/02            (Request/Reply)
+          Sender MAC : 6 bytes             ← we match this
+          Sender IP  : 4 bytes             ← we extract this
+
+        The 8-byte ARP signature (EtherType + header) is highly specific,
+        making false positives in ETL metadata extremely unlikely.
+        """
+        # ARP signature: EtherType(0806) + HWType(0001) + ProtoType(0800) + HWSize(06) + ProtoSize(04)
+        arp_sig = b'\x08\x06\x00\x01\x08\x00\x06\x04'
+
+        with open(etl_file, "rb") as f:
+            data = f.read()
+
+        pos = 0
+        while True:
+            idx = data.find(arp_sig, pos)
+            if idx == -1:
+                break
+
+            # After arp_sig(8 bytes): Opcode(2 bytes) + Sender MAC(6 bytes) + Sender IP(4 bytes)
+            sender_mac_offset = idx + 8 + 2  # skip sig + opcode
+            sender_ip_offset = sender_mac_offset + 6
+
+            if sender_ip_offset + 4 <= len(data):
+                sender_mac_3 = data[sender_mac_offset:sender_mac_offset + 3]
+                if sender_mac_3 == mac_prefix_bytes:
+                    full_mac = data[sender_mac_offset:sender_mac_offset + 6]
+                    sender_ip = data[sender_ip_offset:sender_ip_offset + 4]
+
+                    ip_str = ".".join(str(b) for b in sender_ip)
+                    mac_str = "-".join(f"{b:02X}" for b in full_mac)
+
+                    # Sanity check: IP should be a valid private/routable address
+                    if sender_ip[0] not in (0, 127, 255):
+                        logger.info("pktmon: found device MAC=%s IP=%s", mac_str, ip_str)
+                        return DetectedDevice(ip=ip_str, mac=mac_str, method="mac_address")
+
+            pos = idx + 1
+
+        logger.debug("pktmon: no matching ARP packets found in capture")
+        return None
 
     def _ensure_subnet_ip(self, ethernet_cfg):
         """Set static IP on ethernet adapter if it doesn't already have one on the device's subnet.
