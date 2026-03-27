@@ -116,6 +116,10 @@ class DeviceMonitor:
 
         Returns DetectedDevice(ip, mac) if found, None otherwise.
 
+        Before scanning, ensures the ethernet adapter has an IP on the target
+        subnet. Without this, pings and ARP lookups cannot reach the device
+        (the adapter shows as "unidentified network" with no routable IP).
+
         Two-phase detection for speed:
           Phase 1: Ping priority_ip (e.g. 192.168.220.206) directly → check ARP
                    This completes in ~1 second if the device is at the expected IP.
@@ -136,6 +140,12 @@ class DeviceMonitor:
 
         priority_ip = self._config.target_device.priority_ip
         ethernet_cfg = self._config.ethernet_adapter
+
+        # Ensure ethernet adapter has an IP on the target subnet.
+        # When a device is directly connected, Windows shows "unidentified network"
+        # and the adapter may have no IP or an APIPA (169.254.x.x) address.
+        # Without a routable IP on the same subnet, ping/ARP cannot reach the device.
+        self._ensure_subnet_ip(ethernet_cfg)
 
         # --- Phase 1: Quick check at priority IP ---
         if priority_ip:
@@ -163,6 +173,73 @@ class DeviceMonitor:
             return result
 
         return None
+
+    def _ensure_subnet_ip(self, ethernet_cfg):
+        """Set static IP on ethernet adapter if it doesn't already have one on the target subnet.
+
+        Checks the adapter's current IP. If missing or on a different subnet
+        (e.g. APIPA 169.254.x.x), configures the static IP from config so that
+        ARP/ping-based device detection can work.
+        """
+        import subprocess
+
+        adapter_name = ethernet_cfg.name
+        target_ip = ethernet_cfg.static_ip
+        target_mask = ethernet_cfg.subnet_mask
+
+        # Calculate target subnet
+        target_parts = [int(x) for x in target_ip.split(".")]
+        mask_parts = [int(x) for x in target_mask.split(".")]
+        target_subnet = tuple(target_parts[i] & mask_parts[i] for i in range(4))
+
+        # Get current IP of the adapter
+        try:
+            ps_cmd = (
+                f"Get-NetIPAddress -InterfaceAlias '{adapter_name}' -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                f"Select-Object -Property IPAddress | Format-Table -HideTableHeaders"
+            )
+            result = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=10,
+            )
+            current_ips = [line.strip() for line in result.stdout.split("\n") if line.strip()]
+
+            for ip in current_ips:
+                try:
+                    ip_parts = [int(x) for x in ip.split(".")]
+                    ip_subnet = tuple(ip_parts[i] & mask_parts[i] for i in range(4))
+                    if ip_subnet == target_subnet:
+                        logger.debug("Adapter '%s' already has IP %s on target subnet", adapter_name, ip)
+                        return  # Already on the correct subnet
+                except ValueError:
+                    continue
+
+            logger.info("Adapter '%s' has no IP on target subnet %s - setting static IP %s",
+                        adapter_name, ".".join(str(x) for x in target_subnet), target_ip)
+        except Exception:
+            logger.warning("Could not check adapter IP, will attempt to set static IP")
+
+        # Set static IP via netsh
+        try:
+            cmd = [
+                "netsh", "interface", "ip", "set", "address",
+                f"name={adapter_name}",
+                "source=static",
+                f"addr={target_ip}",
+                f"mask={target_mask}",
+                f"gateway={ethernet_cfg.gateway}",
+                "gwmetric=1",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                logger.info("Static IP %s set on '%s' for device detection", target_ip, adapter_name)
+                # Brief pause for IP to become effective
+                import time
+                time.sleep(2)
+            else:
+                logger.error("Failed to set static IP: %s", result.stderr)
+        except Exception:
+            logger.exception("Exception setting static IP for detection")
 
     def _find_mac_in_arp(self, prefix_dash: str, raw_prefix: str):
         """Search ARP/Neighbor table for a matching MAC prefix.
