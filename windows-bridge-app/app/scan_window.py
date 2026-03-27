@@ -224,14 +224,15 @@ class ScanWindow:
         mac_prefix = self._config.target_device.mac_prefix.upper().replace(":", "").replace("-", "")
         prefix_dash = f"{mac_prefix[0:2]}-{mac_prefix[2:4]}-{mac_prefix[4:6]}"
 
-        ethernet_name = ethernet_cfg.name
+        # Resolve the actual adapter name (handles "Ethernet" vs "이더넷" etc.)
+        ethernet_name = self._resolve_adapter_name(ethernet_cfg.name)
 
         # Detect the adapter's actual current IP (may differ from config)
         actual_ip = self._get_adapter_current_ip(ethernet_name)
         local_ip = actual_ip or ethernet_cfg.static_ip
 
-        logger.info("Scan mode=%s, adapter='%s', actual_ip=%s, config_ip=%s",
-                     mode, ethernet_name, actual_ip, ethernet_cfg.static_ip)
+        logger.info("Scan mode=%s, adapter='%s' (config='%s'), actual_ip=%s, config_ip=%s",
+                     mode, ethernet_name, ethernet_cfg.name, actual_ip, ethernet_cfg.static_ip)
 
         if mode == "direct":
             # --- Phase 1: ARP sniffing (subnet-agnostic, finds any IP range) ---
@@ -291,6 +292,49 @@ class ScanWindow:
 
         self._update_status("Scan complete")
         self._root.after(0, self._scan_complete)
+
+    @staticmethod
+    def _resolve_adapter_name(config_name: str) -> str:
+        """Resolve the actual adapter name on this system.
+
+        Config might say "Ethernet" but on Korean/other locale Windows
+        the adapter could be named "이더넷", "이더넷 2", "Ethernet 2", etc.
+        Checks if the config name exists, and if not, finds an ethernet adapter.
+        """
+        try:
+            # Check if the config name exists
+            ps_check = (
+                f"Get-NetAdapter -Name '{config_name}' -ErrorAction SilentlyContinue | "
+                f"Select-Object -Property Name | Format-Table -HideTableHeaders"
+            )
+            result = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_check],
+                capture_output=True, text=True, timeout=10,
+            )
+            found = result.stdout.strip()
+            if found:
+                return config_name  # Config name is valid
+
+            # Config name not found - search for an ethernet adapter
+            # Look for adapters with MediaType "802.3" (wired ethernet)
+            ps_find = (
+                "Get-NetAdapter | Where-Object { $_.MediaType -eq '802.3' -and $_.Status -eq 'Up' } | "
+                "Select-Object -Property Name | Format-Table -HideTableHeaders"
+            )
+            result = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_find],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.split("\n"):
+                name = line.strip()
+                if name:
+                    logger.info("Config adapter '%s' not found, using detected adapter: '%s'", config_name, name)
+                    return name
+
+        except Exception:
+            logger.exception("Failed to resolve adapter name")
+
+        return config_name  # Fallback to config value
 
     def _get_adapter_current_ip(self, adapter_name: str):
         """Get the actual current IPv4 address of the adapter (not from config).

@@ -28,6 +28,8 @@ class DeviceMonitor:
         self._detected_device = None  # DetectedDevice when connected
         self._running = False
         self._thread = None
+        # Resolve actual adapter name once (handles "Ethernet" vs "이더넷" etc.)
+        self._resolved_adapter_name = None
 
     def start(self):
         self._running = True
@@ -304,7 +306,7 @@ class DeviceMonitor:
         """
         import subprocess
 
-        adapter_name = ethernet_cfg.name
+        adapter_name = self._resolved_adapter_name or ethernet_cfg.name
         target_ip = ethernet_cfg.static_ip
         target_mask = ethernet_cfg.subnet_mask
 
@@ -370,7 +372,7 @@ class DeviceMonitor:
         """
         import subprocess
 
-        ethernet_name = self._config.ethernet_adapter.name
+        ethernet_name = self._resolved_adapter_name or self._config.ethernet_adapter.name
         ethernet_ip = self._config.ethernet_adapter.static_ip
 
         # Method 1: Get-NetNeighbor filtered by ethernet adapter (most reliable)
@@ -459,9 +461,44 @@ class DeviceMonitor:
         except Exception:
             pass  # Best-effort; ARP table may already have entries
 
+    def _get_adapter_name(self, w) -> str:
+        """Get the resolved adapter name, detecting it once on first call.
+
+        Handles locale differences: config may say "Ethernet" but the actual
+        adapter could be "이더넷" (Korean), "이더넷 2", "Ethernet 2", etc.
+        """
+        if self._resolved_adapter_name:
+            return self._resolved_adapter_name
+
+        config_name = self._config.ethernet_adapter.name
+
+        # Check if config name works
+        adapters = w.Win32_NetworkAdapter(NetConnectionID=config_name)
+        if adapters:
+            self._resolved_adapter_name = config_name
+            return config_name
+
+        # Config name not found - search for a wired ethernet adapter
+        logger.info("Adapter '%s' not found via WMI, searching for wired ethernet adapter...", config_name)
+        all_adapters = w.Win32_NetworkAdapter()
+        for adapter in all_adapters:
+            # PhysicalAdapter=True, AdapterTypeId=0 (Ethernet 802.3)
+            if (adapter.PhysicalAdapter and
+                    adapter.AdapterTypeId == 0 and
+                    adapter.NetConnectionID):
+                actual_name = adapter.NetConnectionID
+                logger.info("Found wired ethernet adapter: '%s' (replacing config '%s')", actual_name, config_name)
+                self._resolved_adapter_name = actual_name
+                return actual_name
+
+        # Fallback
+        logger.warning("No wired ethernet adapter found, using config name '%s'", config_name)
+        self._resolved_adapter_name = config_name
+        return config_name
+
     def _check_ethernet_link(self, w) -> bool:
         """Check if the configured ethernet adapter has an active link."""
-        ethernet_name = self._config.ethernet_adapter.name
+        ethernet_name = self._get_adapter_name(w)
         adapters = w.Win32_NetworkAdapter(NetConnectionID=ethernet_name)
         for adapter in adapters:
             # NetConnectionStatus: 2 = Connected

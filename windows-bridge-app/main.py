@@ -78,9 +78,15 @@ def main():
     # Will be set after tray is created
     tray = None
 
+    def get_adapter_name():
+        """Get the resolved adapter name from monitor, falling back to config."""
+        return (monitor._resolved_adapter_name or config.ethernet_adapter.name)
+
     def on_device_connected(device_info):
         logger.info("=== Device Connected - Configuring Network ===")
         logger.info("Detected device IP: %s, MAC: %s", device_info.ip, device_info.mac)
+
+        adapter_name = get_adapter_name()
 
         # Calculate PC IP based on the device's actual IP (device IP - 1)
         # This ensures the PC is on the same subnet regardless of the device's IP range.
@@ -115,7 +121,7 @@ def main():
             gateway = config.ethernet_adapter.gateway
 
         ok = net_config.set_static_ip(
-            config.ethernet_adapter.name,
+            adapter_name,
             pc_ip,
             subnet_mask,
             gateway,
@@ -127,7 +133,7 @@ def main():
             return
 
         net_config.set_dns(
-            config.ethernet_adapter.name,
+            adapter_name,
             config.ethernet_adapter.dns_primary,
             config.ethernet_adapter.dns_secondary,
         )
@@ -135,7 +141,7 @@ def main():
         if config.bridge.auto_create:
             bridge_ok = bridge_mgr.create_bridge(
                 config.bridge.name,
-                config.ethernet_adapter.name,
+                adapter_name,
                 config.wifi_adapter.name,
             )
             if tray:
@@ -149,8 +155,9 @@ def main():
     def on_device_disconnected():
         logger.info("=== Device Disconnected - Reverting Network ===")
 
+        adapter_name = get_adapter_name()
         bridge_mgr.remove_bridge(config.bridge.name)
-        net_config.set_dhcp(config.ethernet_adapter.name)
+        net_config.set_dhcp(adapter_name)
 
         if tray:
             tray.update_state("monitoring")
